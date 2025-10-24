@@ -3,7 +3,7 @@
  * Plugin Name: Medium & Substack Posts Importer
  * Plugin URI: https://github.com/jsrothwell/medium-substack-importer
  * Description: Import and display Medium and Substack posts with proper featured image support
- * Version: 1.2.1
+ * Version: 1.2.2
  * Author: Jamieson Rothwell
  * Author URI: https://lymegrove.com
  * License: GPL v2 or later
@@ -555,6 +555,8 @@ class Medium_Substack_Posts_Importer {
             return $posts;
         }
         
+        error_log('MPI: Should inject - starting process. Current post count: ' . count($posts));
+        
         // Avoid infinite loops
         if (isset($query->query_vars['mpi_processed'])) {
             return $posts;
@@ -572,8 +574,11 @@ class Medium_Substack_Posts_Importer {
         }
         
         if (empty($identifier)) {
+            error_log('MPI: Empty identifier, returning original posts');
             return $posts;
         }
+        
+        error_log('MPI: Identifier found: ' . $identifier);
         
         // Get the number of posts per page
         $posts_per_page = isset($options['posts_count']) ? intval($options['posts_count']) : 10;
@@ -582,31 +587,39 @@ class Medium_Substack_Posts_Importer {
         $data = $this->fetch_feed($platform, $identifier, $posts_per_page);
         
         if (isset($data['error']) || empty($data['posts'])) {
+            error_log('MPI: Error fetching feed or no posts: ' . (isset($data['error']) ? $data['error'] : 'empty'));
             return $posts;
         }
         
-        // Convert external posts to WP_Post-like objects
+        error_log('MPI: Fetched ' . count($data['posts']) . ' external posts');
+        
+        // Convert external posts to WP_Post objects
         $external_posts = array();
+        $fake_id = -1000; // Start with negative IDs to avoid conflicts
         foreach ($data['posts'] as $external_post) {
-            $post_obj = new stdClass();
-            $post_obj->ID = 'external_' . md5($external_post['link']);
-            $post_obj->post_title = $external_post['title'];
-            $post_obj->post_content = $external_post['content'];
-            $post_obj->post_excerpt = $this->create_excerpt($external_post['content'], 55);
-            $post_obj->post_date = date('Y-m-d H:i:s', strtotime($external_post['pubDate']));
-            $post_obj->post_date_gmt = gmdate('Y-m-d H:i:s', strtotime($external_post['pubDate']));
-            $post_obj->post_type = 'post';
-            $post_obj->post_status = 'publish';
-            $post_obj->comment_status = 'closed';
-            $post_obj->ping_status = 'closed';
-            $post_obj->post_name = sanitize_title($external_post['title']);
-            $post_obj->guid = $external_post['link'];
-            $post_obj->post_author = 1;
-            $post_obj->post_modified = $post_obj->post_date;
-            $post_obj->post_modified_gmt = $post_obj->post_date_gmt;
-            $post_obj->filter = 'raw';
+            // Create a proper WP_Post object instead of stdClass
+            $post_data = array(
+                'ID' => $fake_id--,
+                'post_title' => $external_post['title'],
+                'post_content' => $external_post['content'],
+                'post_excerpt' => $this->create_excerpt($external_post['content'], 55),
+                'post_date' => date('Y-m-d H:i:s', strtotime($external_post['pubDate'])),
+                'post_date_gmt' => gmdate('Y-m-d H:i:s', strtotime($external_post['pubDate'])),
+                'post_type' => 'post',
+                'post_status' => 'publish',
+                'comment_status' => 'closed',
+                'ping_status' => 'closed',
+                'post_name' => sanitize_title($external_post['title']),
+                'guid' => $external_post['link'],
+                'post_author' => 1,
+                'post_modified' => date('Y-m-d H:i:s', strtotime($external_post['pubDate'])),
+                'post_modified_gmt' => gmdate('Y-m-d H:i:s', strtotime($external_post['pubDate'])),
+                'filter' => 'raw'
+            );
             
-            // Store external post metadata
+            $post_obj = new WP_Post((object) $post_data);
+            
+            // Store external post metadata as properties
             $post_obj->is_external = true;
             $post_obj->external_link = $external_post['link'];
             $post_obj->external_image = $external_post['image'];
@@ -630,6 +643,8 @@ class Medium_Substack_Posts_Importer {
         // Update post count
         $query->found_posts = count($merged_posts);
         $query->post_count = count($merged_posts);
+        
+        error_log('MPI: Returning ' . count($merged_posts) . ' merged posts (was ' . count($posts) . ' + ' . count($external_posts) . ' external)');
         
         return $merged_posts;
     }
