@@ -3,7 +3,7 @@
  * Plugin Name: Medium & Substack Posts Importer
  * Plugin URI: https://github.com/jsrothwell/medium-substack-importer
  * Description: Import and display Medium and Substack posts with proper featured image support
- * Version: 1.2.0
+ * Version: 1.2.1
  * Author: Jamieson Rothwell
  * Author URI: https://lymegrove.com
  * License: GPL v2 or later
@@ -542,8 +542,16 @@ class Medium_Substack_Posts_Importer {
      * Inject external posts into the main WordPress loop
      */
     public function inject_external_posts($posts, $query) {
-        // Only modify the main query on the home page
-        if (!$query->is_main_query() || !$query->is_home()) {
+        // More flexible conditions - check if we're on the blog/home page
+        $should_inject = false;
+        
+        if ($query->is_main_query()) {
+            if ($query->is_home() || ($query->is_front_page() && get_option('show_on_front') === 'posts')) {
+                $should_inject = true;
+            }
+        }
+        
+        if (!$should_inject) {
             return $posts;
         }
         
