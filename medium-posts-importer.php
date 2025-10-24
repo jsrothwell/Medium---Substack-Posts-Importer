@@ -3,7 +3,7 @@
  * Plugin Name: Medium & Substack Posts Importer
  * Plugin URI: https://github.com/jsrothwell/medium-substack-importer
  * Description: Import and display Medium and Substack posts with proper featured image support
- * Version: 1.1.0
+ * Version: 1.2.0
  * Author: Jamieson Rothwell
  * Author URI: https://lymegrove.com
  * License: GPL v2 or later
@@ -29,6 +29,18 @@ class Medium_Substack_Posts_Importer {
         
         // Enqueue styles
         add_action('wp_enqueue_scripts', array($this, 'enqueue_styles'));
+        
+        // Inject into main feed if enabled
+        $options = get_option($this->option_name);
+        if (isset($options['inject_into_feed']) && $options['inject_into_feed']) {
+            add_filter('the_posts', array($this, 'inject_external_posts'), 10, 2);
+            add_filter('post_link', array($this, 'external_post_link'), 10, 2);
+            add_filter('post_type_link', array($this, 'external_post_link'), 10, 2);
+            add_filter('the_permalink', array($this, 'external_post_link'), 10, 2);
+            add_filter('post_thumbnail_html', array($this, 'external_post_thumbnail'), 10, 5);
+            add_filter('has_post_thumbnail', array($this, 'external_has_thumbnail'), 10, 2);
+            add_filter('the_content', array($this, 'external_post_content'), 10, 1);
+        }
     }
     
     /**
@@ -112,6 +124,14 @@ class Medium_Substack_Posts_Importer {
             'medium-posts-importer',
             'mpi_main_section'
         );
+        
+        add_settings_field(
+            'inject_into_feed',
+            'Inject into Main Feed',
+            array($this, 'inject_into_feed_callback'),
+            'medium-posts-importer',
+            'mpi_main_section'
+        );
     }
     
     public function settings_section_callback() {
@@ -187,6 +207,14 @@ class Medium_Substack_Posts_Importer {
         echo '<input type="number" name="' . $this->option_name . '[excerpt_length]" value="' . esc_attr($length) . '" min="10" max="200" />';
     }
     
+    public function inject_into_feed_callback() {
+        $options = get_option($this->option_name);
+        $inject = isset($options['inject_into_feed']) ? $options['inject_into_feed'] : 0;
+        echo '<input type="checkbox" name="' . $this->option_name . '[inject_into_feed]" value="1" ' . checked(1, $inject, false) . ' />';
+        echo ' <label>Automatically display Medium/Substack posts in your main blog feed</label>';
+        echo '<p class="description">When enabled, your external posts will appear mixed with your WordPress posts on the home page.</p>';
+    }
+    
     /**
      * Settings page HTML
      */
@@ -221,6 +249,11 @@ class Medium_Substack_Posts_Importer {
             <hr>
             
             <h2>How to Use</h2>
+            
+            <h3>Method 1: Automatic Feed Injection</h3>
+            <p>Enable "Inject into Main Feed" above to automatically display your Medium/Substack posts mixed with your WordPress posts on your home page. External posts will be clearly marked with a badge.</p>
+            
+            <h3>Method 2: Shortcode</h3>
             <p>Use this shortcode to display your Medium or Substack posts anywhere on your site:</p>
             <code>[medium_posts]</code>
             
@@ -506,6 +539,167 @@ class Medium_Substack_Posts_Importer {
     }
     
     /**
+     * Inject external posts into the main WordPress loop
+     */
+    public function inject_external_posts($posts, $query) {
+        // Only modify the main query on the home page
+        if (!$query->is_main_query() || !$query->is_home()) {
+            return $posts;
+        }
+        
+        // Avoid infinite loops
+        if (isset($query->query_vars['mpi_processed'])) {
+            return $posts;
+        }
+        
+        $query->query_vars['mpi_processed'] = true;
+        
+        $options = get_option($this->option_name);
+        $platform = isset($options['platform']) ? $options['platform'] : 'medium';
+        
+        if ($platform === 'medium') {
+            $identifier = isset($options['medium_handle']) ? $options['medium_handle'] : '';
+        } else {
+            $identifier = isset($options['substack_url']) ? $options['substack_url'] : '';
+        }
+        
+        if (empty($identifier)) {
+            return $posts;
+        }
+        
+        // Get the number of posts per page
+        $posts_per_page = isset($options['posts_count']) ? intval($options['posts_count']) : 10;
+        
+        // Fetch external posts
+        $data = $this->fetch_feed($platform, $identifier, $posts_per_page);
+        
+        if (isset($data['error']) || empty($data['posts'])) {
+            return $posts;
+        }
+        
+        // Convert external posts to WP_Post-like objects
+        $external_posts = array();
+        foreach ($data['posts'] as $external_post) {
+            $post_obj = new stdClass();
+            $post_obj->ID = 'external_' . md5($external_post['link']);
+            $post_obj->post_title = $external_post['title'];
+            $post_obj->post_content = $external_post['content'];
+            $post_obj->post_excerpt = $this->create_excerpt($external_post['content'], 55);
+            $post_obj->post_date = date('Y-m-d H:i:s', strtotime($external_post['pubDate']));
+            $post_obj->post_date_gmt = gmdate('Y-m-d H:i:s', strtotime($external_post['pubDate']));
+            $post_obj->post_type = 'post';
+            $post_obj->post_status = 'publish';
+            $post_obj->comment_status = 'closed';
+            $post_obj->ping_status = 'closed';
+            $post_obj->post_name = sanitize_title($external_post['title']);
+            $post_obj->guid = $external_post['link'];
+            $post_obj->post_author = 1;
+            $post_obj->post_modified = $post_obj->post_date;
+            $post_obj->post_modified_gmt = $post_obj->post_date_gmt;
+            $post_obj->filter = 'raw';
+            
+            // Store external post metadata
+            $post_obj->is_external = true;
+            $post_obj->external_link = $external_post['link'];
+            $post_obj->external_image = $external_post['image'];
+            $post_obj->external_platform = $platform;
+            $post_obj->external_categories = $external_post['categories'];
+            
+            $external_posts[] = $post_obj;
+        }
+        
+        // Merge and sort by date
+        $merged_posts = array_merge($posts, $external_posts);
+        
+        usort($merged_posts, function($a, $b) {
+            return strtotime($b->post_date) - strtotime($a->post_date);
+        });
+        
+        // Limit to posts_per_page
+        $posts_per_page_setting = get_option('posts_per_page', 10);
+        $merged_posts = array_slice($merged_posts, 0, $posts_per_page_setting);
+        
+        // Update post count
+        $query->found_posts = count($merged_posts);
+        $query->post_count = count($merged_posts);
+        
+        return $merged_posts;
+    }
+    
+    /**
+     * Modify permalink for external posts
+     */
+    public function external_post_link($permalink, $post) {
+        if (is_object($post) && isset($post->is_external) && $post->is_external) {
+            return $post->external_link;
+        }
+        return $permalink;
+    }
+    
+    /**
+     * Add external post thumbnail
+     */
+    public function external_post_thumbnail($html, $post_id, $post_thumbnail_id, $size, $attr) {
+        global $post;
+        
+        if (is_object($post) && isset($post->is_external) && $post->is_external && !empty($post->external_image)) {
+            $image_url = esc_url($post->external_image);
+            $alt = esc_attr($post->post_title);
+            
+            $html = sprintf(
+                '<img src="%s" alt="%s" class="attachment-post-thumbnail size-post-thumbnail wp-post-image" loading="lazy">',
+                $image_url,
+                $alt
+            );
+        }
+        
+        return $html;
+    }
+    
+    /**
+     * Tell WordPress that external posts have thumbnails
+     */
+    public function external_has_thumbnail($has_thumbnail, $post) {
+        if (is_object($post) && isset($post->is_external) && $post->is_external && !empty($post->external_image)) {
+            return true;
+        }
+        return $has_thumbnail;
+    }
+    
+    /**
+     * Modify content for external posts
+     */
+    public function external_post_content($content) {
+        global $post;
+        
+        if (is_object($post) && isset($post->is_external) && $post->is_external) {
+            // Add a badge to indicate external post
+            $platform_label = ucfirst($post->external_platform);
+            $badge = sprintf(
+                '<div class="mpi-external-badge">Originally published on <a href="%s" target="_blank" rel="noopener">%s</a> →</div>',
+                esc_url($post->external_link),
+                esc_html($platform_label)
+            );
+            
+            // On archive pages, show excerpt with link
+            if (!is_singular()) {
+                $excerpt = $post->post_excerpt;
+                $read_more = sprintf(
+                    '<p><a href="%s" class="mpi-read-more-feed" target="_blank" rel="noopener">Read full article on %s →</a></p>',
+                    esc_url($post->external_link),
+                    esc_html($platform_label)
+                );
+                
+                return $badge . '<p>' . esc_html($excerpt) . '</p>' . $read_more;
+            }
+            
+            return $badge . $content;
+        }
+        
+        return $content;
+    }
+    
+    /**
      * Enqueue styles
      */
     public function enqueue_styles() {
@@ -617,6 +811,38 @@ class Medium_Substack_Posts_Importer {
                     border: 1px solid #ffc107;
                     border-radius: 4px;
                     color: #856404;
+                }
+                
+                /* External post styling in main feed */
+                .mpi-external-badge {
+                    display: inline-block;
+                    padding: 0.5rem 1rem;
+                    margin-bottom: 1rem;
+                    background: #f0f7ff;
+                    border-left: 3px solid #0066cc;
+                    font-size: 0.9rem;
+                    color: #333;
+                }
+                
+                .mpi-external-badge a {
+                    color: #0066cc;
+                    text-decoration: none;
+                    font-weight: 500;
+                }
+                
+                .mpi-external-badge a:hover {
+                    text-decoration: underline;
+                }
+                
+                .mpi-read-more-feed {
+                    display: inline-block;
+                    color: #0066cc;
+                    text-decoration: none;
+                    font-weight: 500;
+                }
+                
+                .mpi-read-more-feed:hover {
+                    text-decoration: underline;
                 }
             ";
             
