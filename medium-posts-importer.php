@@ -1,11 +1,11 @@
 <?php
 /**
  * Plugin Name: Medium & Substack Posts Importer
- * Plugin URI: https://jamiesonrothwell.com
+ * Plugin URI: https://github.com/jsrothwell/medium-substack-importer
  * Description: Import and display Medium and Substack posts with proper featured image support
  * Version: 1.1.0
- * Author: Jamie Rothwell
- * Author URI: https://jamiesonrothwell.com
+ * Author: Jamieson Rothwell
+ * Author URI: https://lymegrove.com
  * License: GPL v2 or later
  * Text Domain: medium-posts-importer
  */
@@ -150,8 +150,8 @@ class Medium_Substack_Posts_Importer {
     public function medium_handle_callback() {
         $options = get_option($this->option_name);
         $handle = isset($options['medium_handle']) ? $options['medium_handle'] : '';
-        echo '<input type="text" name="' . $this->option_name . '[medium_handle]" value="' . esc_attr($handle) . '" class="regular-text" placeholder="@yourusername" />';
-        echo '<p class="description">Your Medium username (e.g., @jamierothwell)</p>';
+        echo '<input type="text" name="' . $this->option_name . '[medium_handle]" value="' . esc_attr($handle) . '" class="regular-text" placeholder="yourusername" />';
+        echo '<p class="description">Your Medium username (e.g., johndoe or @johndoe)</p>';
     }
     
     public function substack_url_callback() {
