@@ -3,7 +3,7 @@
  * Plugin Name: Medium & Substack Posts Importer
  * Plugin URI: https://github.com/jsrothwell/medium-substack-importer
  * Description: Import and display Medium and Substack posts with proper featured image support
- * Version: 1.2.2
+ * Version: 1.4.1
  * Author: Jamieson Rothwell
  * Author URI: https://lymegrove.com
  * License: GPL v2 or later
@@ -18,6 +18,7 @@ if (!defined('ABSPATH')) {
 class Medium_Substack_Posts_Importer {
     
     private $option_name = 'mpi_settings';
+    private static $external_posts_cache = array();  // Cache for external posts
     
     public function __construct() {
         // Admin menu
@@ -33,6 +34,7 @@ class Medium_Substack_Posts_Importer {
         // Inject into main feed if enabled
         $options = get_option($this->option_name);
         if (isset($options['inject_into_feed']) && $options['inject_into_feed']) {
+            add_action('pre_get_posts', array($this, 'modify_main_query'), 1);
             add_filter('the_posts', array($this, 'inject_external_posts'), 10, 2);
             add_filter('post_link', array($this, 'external_post_link'), 10, 2);
             add_filter('post_type_link', array($this, 'external_post_link'), 10, 2);
@@ -40,7 +42,26 @@ class Medium_Substack_Posts_Importer {
             add_filter('post_thumbnail_html', array($this, 'external_post_thumbnail'), 10, 5);
             add_filter('has_post_thumbnail', array($this, 'external_has_thumbnail'), 10, 2);
             add_filter('the_content', array($this, 'external_post_content'), 10, 1);
+            add_filter('the_title', array($this, 'debug_the_title'), 10, 2);  // Debug filter
+            add_filter('get_the_excerpt', array($this, 'external_post_excerpt'), 10, 2);
+            add_filter('the_excerpt', array($this, 'external_post_excerpt_display'), 10);
+            add_filter('get_post', array($this, 'get_external_post'), 10, 2);  // Critical filter
         }
+    }
+    
+    /**
+     * Modify the main query to include external posts
+     */
+    public function modify_main_query($query) {
+        // Only modify main query on home page
+        if (!$query->is_main_query() || !is_home()) {
+            return;
+        }
+        
+        // Set a flag so we know this query should get external posts
+        $query->set('include_external_posts', true);
+        
+        error_log('MPI: pre_get_posts - flagged query for external posts');
     }
     
     /**
@@ -224,14 +245,11 @@ class Medium_Substack_Posts_Importer {
         }
         
         if (isset($_GET['settings-updated'])) {
-            // Clear the cache when settings are updated
-            delete_transient('mpi_medium_feed');
-            delete_transient('mpi_substack_feed');
-            // Clear all mpi_feed transients
+            // Clear the cache when settings are updated - FORCE CLEAR EVERYTHING
             global $wpdb;
-            $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_mpi_feed_%'");
-            $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_timeout_mpi_feed_%'");
-            add_settings_error('mpi_messages', 'mpi_message', 'Settings Saved & Cache Cleared', 'updated');
+            $deleted = $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_mpi_feed_%' OR option_name LIKE '_transient_timeout_mpi_feed_%'");
+            error_log('MPI: Cleared ' . $deleted . ' cached feed transients');
+            add_settings_error('mpi_messages', 'mpi_message', 'Settings Saved & Cache Cleared (' . $deleted . ' items)', 'updated');
         }
         
         settings_errors('mpi_messages');
@@ -276,13 +294,10 @@ class Medium_Substack_Posts_Importer {
             
             <?php
             if (isset($_POST['clear_cache']) && check_admin_referer('mpi_clear_cache', 'mpi_clear_cache_nonce')) {
-                delete_transient('mpi_medium_feed');
-                delete_transient('mpi_substack_feed');
-                // Clear all mpi_feed transients
                 global $wpdb;
-                $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_mpi_feed_%'");
-                $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_timeout_mpi_feed_%'");
-                echo '<div class="notice notice-success"><p>Cache cleared successfully!</p></div>';
+                $deleted = $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_mpi_feed_%' OR option_name LIKE '_transient_timeout_mpi_feed_%'");
+                error_log('MPI: Manual cache clear - deleted ' . $deleted . ' transients');
+                echo '<div class="notice notice-success"><p>Cache cleared successfully! Deleted ' . $deleted . ' cached items.</p></div>';
             }
             ?>
         </div>
@@ -293,13 +308,16 @@ class Medium_Substack_Posts_Importer {
      * Fetch feed from Medium or Substack
      */
     private function fetch_feed($platform, $identifier, $count) {
-        // Check cache first
+        // TEMPORARY: Skip cache for debugging
         $cache_key = 'mpi_feed_' . md5($platform . $identifier . $count);
-        $cached_data = get_transient($cache_key);
+        $cached_data = false; // Disabled: get_transient($cache_key);
         
         if ($cached_data !== false) {
+            error_log('MPI: Using cached data');
             return $cached_data;
         }
+        
+        error_log('MPI: No cache, fetching fresh data from feed');
         
         // Construct feed URL based on platform
         if ($platform === 'medium') {
@@ -335,14 +353,26 @@ class Medium_Substack_Posts_Importer {
         $xml = simplexml_load_string($body);
         
         if ($xml === false) {
+            $errors = libxml_get_errors();
+            error_log('MPI: XML parsing failed. Errors: ' . print_r($errors, true));
             return array('error' => 'Could not parse feed XML');
         }
+        
+        error_log('MPI: XML parsed successfully');
         
         $posts = array();
         $items = $xml->channel->item;
         
-        foreach ($items as $index => $item) {
-            if ($index >= $count) {
+        if (!$items) {
+            error_log('MPI: No items found in XML. XML structure: ' . print_r($xml, true));
+            return array('posts' => array());
+        }
+        
+        error_log('MPI: Found ' . count($items) . ' items in XML');
+        
+        $item_index = 0;  // Manual counter for numeric tracking
+        foreach ($items as $item) {
+            if ($item_index >= $count) {
                 break;
             }
             
@@ -385,7 +415,11 @@ class Medium_Substack_Posts_Importer {
                 'image' => $image_url,
                 'categories' => $categories
             );
+            
+            $item_index++;  // Increment our manual counter
         }
+        
+        error_log('MPI: Finished processing. Total posts collected: ' . count($posts));
         
         $data = array('posts' => $posts);
         
@@ -542,11 +576,21 @@ class Medium_Substack_Posts_Importer {
      * Inject external posts into the main WordPress loop
      */
     public function inject_external_posts($posts, $query) {
-        // More flexible conditions - check if we're on the blog/home page
+        error_log('MPI: the_posts filter - Query details: is_main=' . ($query->is_main_query() ? 'YES' : 'NO') . ', is_home=' . ($query->is_home() ? 'YES' : 'NO') . ', post_count=' . count($posts));
+        
+        // Only inject into the FIRST home query per page load
+        static $already_injected = false;
+        if ($already_injected) {
+            return $posts;
+        }
+        
+        // More flexible conditions - inject into home page queries
         $should_inject = false;
         
-        if ($query->is_main_query()) {
-            if ($query->is_home() || ($query->is_front_page() && get_option('show_on_front') === 'posts')) {
+        if ($query->is_home() || ($query->is_front_page() && get_option('show_on_front') === 'posts')) {
+            // Only inject if this query actually has posts or is the main query
+            // This prevents injecting into empty sidebar/widget queries
+            if ($query->is_main_query() || count($posts) > 5) {
                 $should_inject = true;
             }
         }
@@ -557,12 +601,8 @@ class Medium_Substack_Posts_Importer {
         
         error_log('MPI: Should inject - starting process. Current post count: ' . count($posts));
         
-        // Avoid infinite loops
-        if (isset($query->query_vars['mpi_processed'])) {
-            return $posts;
-        }
-        
-        $query->query_vars['mpi_processed'] = true;
+        // Mark as injected
+        $already_injected = true;
         
         $options = get_option($this->option_name);
         $platform = isset($options['platform']) ? $options['platform'] : 'medium';
@@ -586,8 +626,13 @@ class Medium_Substack_Posts_Importer {
         // Fetch external posts
         $data = $this->fetch_feed($platform, $identifier, $posts_per_page);
         
-        if (isset($data['error']) || empty($data['posts'])) {
-            error_log('MPI: Error fetching feed or no posts: ' . (isset($data['error']) ? $data['error'] : 'empty'));
+        if (isset($data['error'])) {
+            error_log('MPI: Error fetching feed: ' . $data['error']);
+            return $posts;
+        }
+        
+        if (empty($data['posts'])) {
+            error_log('MPI: Feed data empty or no posts. Data: ' . print_r($data, true));
             return $posts;
         }
         
@@ -600,20 +645,28 @@ class Medium_Substack_Posts_Importer {
             // Create a proper WP_Post object instead of stdClass
             $post_data = array(
                 'ID' => $fake_id--,
-                'post_title' => $external_post['title'],
-                'post_content' => $external_post['content'],
-                'post_excerpt' => $this->create_excerpt($external_post['content'], 55),
+                'post_author' => 1,
                 'post_date' => date('Y-m-d H:i:s', strtotime($external_post['pubDate'])),
                 'post_date_gmt' => gmdate('Y-m-d H:i:s', strtotime($external_post['pubDate'])),
-                'post_type' => 'post',
+                'post_content' => $external_post['content'],
+                'post_title' => $external_post['title'],
+                'post_excerpt' => $this->create_excerpt($external_post['content'], 55),
                 'post_status' => 'publish',
                 'comment_status' => 'closed',
                 'ping_status' => 'closed',
+                'post_password' => '',
                 'post_name' => sanitize_title($external_post['title']),
-                'guid' => $external_post['link'],
-                'post_author' => 1,
+                'to_ping' => '',
+                'pinged' => '',
                 'post_modified' => date('Y-m-d H:i:s', strtotime($external_post['pubDate'])),
                 'post_modified_gmt' => gmdate('Y-m-d H:i:s', strtotime($external_post['pubDate'])),
+                'post_content_filtered' => '',
+                'post_parent' => 0,
+                'guid' => $external_post['link'],
+                'menu_order' => 0,
+                'post_type' => 'post',
+                'post_mime_type' => '',
+                'comment_count' => 0,
                 'filter' => 'raw'
             );
             
@@ -626,6 +679,9 @@ class Medium_Substack_Posts_Importer {
             $post_obj->external_platform = $platform;
             $post_obj->external_categories = $external_post['categories'];
             
+            // Cache the external post so get_post() can find it
+            self::$external_posts_cache[$post_obj->ID] = $post_obj;
+            
             $external_posts[] = $post_obj;
         }
         
@@ -636,17 +692,23 @@ class Medium_Substack_Posts_Importer {
             return strtotime($b->post_date) - strtotime($a->post_date);
         });
         
-        // Limit to posts_per_page
-        $posts_per_page_setting = get_option('posts_per_page', 10);
-        $merged_posts = array_slice($merged_posts, 0, $posts_per_page_setting);
+        // Get pagination settings
+        $posts_per_page = get_option('posts_per_page', 10);
+        $paged = max(1, $query->get('paged'));
+        $offset = ($paged - 1) * $posts_per_page;
         
-        // Update post count
-        $query->found_posts = count($merged_posts);
-        $query->post_count = count($merged_posts);
+        // Calculate total and slice for current page
+        $total_posts = count($merged_posts);
+        $page_posts = array_slice($merged_posts, $offset, $posts_per_page);
         
-        error_log('MPI: Returning ' . count($merged_posts) . ' merged posts (was ' . count($posts) . ' + ' . count($external_posts) . ' external)');
+        // Update query with correct counts for pagination
+        $query->found_posts = $total_posts;
+        $query->max_num_pages = ceil($total_posts / $posts_per_page);
+        $query->post_count = count($page_posts);
         
-        return $merged_posts;
+        error_log('MPI: Injected ' . count($external_posts) . ' external posts. Total: ' . $total_posts . ' posts, Page: ' . $paged . ', Returning: ' . count($page_posts) . ' posts for this page.');
+        
+        return $page_posts;
     }
     
     /**
@@ -665,7 +727,10 @@ class Medium_Substack_Posts_Importer {
     public function external_post_thumbnail($html, $post_id, $post_thumbnail_id, $size, $attr) {
         global $post;
         
+        error_log("MPI: external_post_thumbnail called - post_id: $post_id, has post: " . (is_object($post) ? 'YES' : 'NO'));
+        
         if (is_object($post) && isset($post->is_external) && $post->is_external && !empty($post->external_image)) {
+            error_log("MPI: Returning external image: " . $post->external_image);
             $image_url = esc_url($post->external_image);
             $alt = esc_attr($post->post_title);
             
@@ -720,6 +785,67 @@ class Medium_Substack_Posts_Importer {
         }
         
         return $content;
+    }
+    
+    /**
+     * Filter to ensure external post titles are returned properly
+     */
+    public function debug_the_title($title, $id) {
+        global $post;
+        
+        // If title is empty and we have an external post, return its title
+        if (empty($title) && is_object($post) && isset($post->is_external) && $post->is_external) {
+            return $post->post_title;
+        }
+        
+        return $title;
+    }
+    
+    /**
+     * Filter to ensure external post excerpts are returned properly
+     */
+    public function external_post_excerpt($excerpt, $post) {
+        if (is_object($post) && isset($post->is_external) && $post->is_external) {
+            if (empty($excerpt)) {
+                $excerpt = $post->post_excerpt;
+            }
+        }
+        return $excerpt;
+    }
+    
+    /**
+     * Filter for the_excerpt display
+     */
+    public function external_post_excerpt_display($excerpt) {
+        global $post;
+        
+        if (is_object($post) && isset($post->is_external) && $post->is_external) {
+            if (empty($excerpt)) {
+                $excerpt = $post->post_excerpt;
+            }
+        }
+        
+        return $excerpt;
+    }
+    
+    /**
+     * Intercept get_post() calls to return external posts before database query  
+     */
+    public function get_external_post($post, $output) {
+        // Get the post ID from the global context if available
+        if (is_null($post)) {
+            global $id;
+            if (!empty($id) && isset(self::$external_posts_cache[$id])) {
+                return self::$external_posts_cache[$id];
+            }
+        }
+        
+        // If we have a post object with a negative ID, make sure it's from our cache
+        if (is_object($post) && $post->ID < 0 && isset(self::$external_posts_cache[$post->ID])) {
+            return self::$external_posts_cache[$post->ID];
+        }
+        
+        return $post;
     }
     
     /**
