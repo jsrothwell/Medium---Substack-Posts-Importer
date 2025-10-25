@@ -3,7 +3,7 @@
  * Plugin Name: Medium & Substack Posts Importer
  * Plugin URI: https://github.com/jsrothwell/medium-substack-importer
  * Description: Import and display Medium and Substack posts with proper featured image support
- * Version: 1.4.1
+ * Version: 1.4.2
  * Author: Jamieson Rothwell
  * Author URI: https://lymegrove.com
  * License: GPL v2 or later
@@ -578,24 +578,19 @@ class Medium_Substack_Posts_Importer {
     public function inject_external_posts($posts, $query) {
         error_log('MPI: the_posts filter - Query details: is_main=' . ($query->is_main_query() ? 'YES' : 'NO') . ', is_home=' . ($query->is_home() ? 'YES' : 'NO') . ', post_count=' . count($posts));
         
-        // Only inject into the FIRST home query per page load
+        // Only inject into the FIRST home query with posts
         static $already_injected = false;
         if ($already_injected) {
             return $posts;
         }
         
-        // More flexible conditions - inject into home page queries
-        $should_inject = false;
-        
-        if ($query->is_home() || ($query->is_front_page() && get_option('show_on_front') === 'posts')) {
-            // Only inject if this query actually has posts or is the main query
-            // This prevents injecting into empty sidebar/widget queries
-            if ($query->is_main_query() || count($posts) > 5) {
-                $should_inject = true;
-            }
+        // Check if this is a home page query
+        if (!($query->is_home() || ($query->is_front_page() && get_option('show_on_front') === 'posts'))) {
+            return $posts;
         }
         
-        if (!$should_inject) {
+        // Only inject into queries that have posts (skip empty sidebar/widget queries)
+        if (count($posts) < 1) {
             return $posts;
         }
         
