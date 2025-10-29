@@ -3,7 +3,7 @@
  * Plugin Name: Medium & Substack Posts Importer
  * Plugin URI: https://github.com/jsrothwell/medium-substack-importer
  * Description: Import and display Medium and Substack posts with proper featured image support
- * Version: 1.4.2
+ * Version: 2.0.1
  * Author: Jamieson Rothwell
  * Author URI: https://lymegrove.com
  * License: GPL v2 or later
@@ -491,7 +491,15 @@ class Medium_Substack_Posts_Importer {
         
         $atts = shortcode_atts(array(
             'count' => isset($options['posts_count']) ? $options['posts_count'] : 10,
-            'columns' => 3
+            'columns' => 3,
+            'layout' => 'grid', // 'grid', 'list', 'compact', 'featured'
+            'show_excerpt' => isset($options['show_excerpt']) ? $options['show_excerpt'] : 1,
+            'show_image' => 1,
+            'show_date' => 1,
+            'show_categories' => 1,
+            'excerpt_length' => isset($options['excerpt_length']) ? intval($options['excerpt_length']) : 50,
+            'category' => '', // Filter by category
+            'order' => 'desc' // 'desc' or 'asc'
         ), $atts);
         
         $platform = isset($options['platform']) ? $options['platform'] : 'medium';
@@ -518,20 +526,32 @@ class Medium_Substack_Posts_Importer {
             return '<p class="mpi-error">No posts found</p>';
         }
         
-        $show_excerpt = isset($options['show_excerpt']) ? $options['show_excerpt'] : 1;
-        $excerpt_length = isset($options['excerpt_length']) ? intval($options['excerpt_length']) : 50;
+        $posts = $data['posts'];
+        
+        // Filter by category if specified
+        if (!empty($atts['category'])) {
+            $posts = array_filter($posts, function($post) use ($atts) {
+                return in_array($atts['category'], $post['categories']);
+            });
+        }
+        
+        // Reverse order if asc
+        if ($atts['order'] === 'asc') {
+            $posts = array_reverse($posts);
+        }
         
         $columns = intval($atts['columns']);
         $columns = max(1, min(4, $columns)); // Limit between 1-4
         
         $platform_label = ucfirst($platform);
+        $layout = $atts['layout'];
         
         ob_start();
         ?>
-        <div class="mpi-posts-grid mpi-columns-<?php echo $columns; ?>">
-            <?php foreach ($data['posts'] as $post): ?>
-                <article class="mpi-post">
-                    <?php if (!empty($post['image'])): ?>
+        <div class="mpi-posts-<?php echo esc_attr($layout); ?> mpi-columns-<?php echo $columns; ?>">
+            <?php foreach ($posts as $index => $post): ?>
+                <article class="mpi-post <?php echo ($layout === 'featured' && $index === 0) ? 'mpi-featured' : ''; ?>">
+                    <?php if ($atts['show_image'] && !empty($post['image'])): ?>
                         <div class="mpi-post-image">
                             <a href="<?php echo esc_url($post['link']); ?>" target="_blank" rel="noopener">
                                 <img src="<?php echo esc_url($post['image']); ?>" alt="<?php echo esc_attr($post['title']); ?>" loading="lazy">
@@ -546,18 +566,22 @@ class Medium_Substack_Posts_Importer {
                             </a>
                         </h3>
                         
-                        <div class="mpi-post-meta">
-                            <span class="mpi-post-date"><?php echo date('F j, Y', strtotime($post['pubDate'])); ?></span>
-                            <?php if (!empty($post['categories'])): ?>
-                                <span class="mpi-post-categories">
-                                    <?php echo esc_html(implode(', ', array_slice($post['categories'], 0, 3))); ?>
-                                </span>
-                            <?php endif; ?>
-                        </div>
+                        <?php if ($atts['show_date'] || ($atts['show_categories'] && !empty($post['categories']))): ?>
+                            <div class="mpi-post-meta">
+                                <?php if ($atts['show_date']): ?>
+                                    <span class="mpi-post-date"><?php echo date('F j, Y', strtotime($post['pubDate'])); ?></span>
+                                <?php endif; ?>
+                                <?php if ($atts['show_categories'] && !empty($post['categories'])): ?>
+                                    <span class="mpi-post-categories">
+                                        <?php echo esc_html(implode(', ', array_slice($post['categories'], 0, 3))); ?>
+                                    </span>
+                                <?php endif; ?>
+                            </div>
+                        <?php endif; ?>
                         
-                        <?php if ($show_excerpt): ?>
+                        <?php if ($atts['show_excerpt']): ?>
                             <div class="mpi-post-excerpt">
-                                <?php echo esc_html($this->create_excerpt($post['content'], $excerpt_length)); ?>
+                                <?php echo esc_html($this->create_excerpt($post['content'], $atts['excerpt_length'])); ?>
                             </div>
                         <?php endif; ?>
                         
@@ -576,11 +600,16 @@ class Medium_Substack_Posts_Importer {
      * Inject external posts into the main WordPress loop
      */
     public function inject_external_posts($posts, $query) {
-        error_log('MPI: the_posts filter - Query details: is_main=' . ($query->is_main_query() ? 'YES' : 'NO') . ', is_home=' . ($query->is_home() ? 'YES' : 'NO') . ', post_count=' . count($posts));
+        error_log('MPI Filter Called - is_main_query: ' . ($query->is_main_query() ? 'YES' : 'NO') . ', is_home: ' . ($query->is_home() ? 'YES' : 'NO') . ', post_count: ' . count($posts));
         
-        // Only inject into the FIRST home query with posts
+        // Prevent multiple injections
         static $already_injected = false;
         if ($already_injected) {
+            return $posts;
+        }
+        
+        // Only inject into the MAIN query on the home page
+        if (!$query->is_main_query()) {
             return $posts;
         }
         
@@ -589,14 +618,7 @@ class Medium_Substack_Posts_Importer {
             return $posts;
         }
         
-        // Only inject into queries that have posts (skip empty sidebar/widget queries)
-        if (count($posts) < 1) {
-            return $posts;
-        }
-        
         error_log('MPI: Should inject - starting process. Current post count: ' . count($posts));
-        
-        // Mark as injected
         $already_injected = true;
         
         $options = get_option($this->option_name);
@@ -865,6 +887,85 @@ class Medium_Substack_Posts_Importer {
                 
                 @media (max-width: 768px) {
                     .mpi-posts-grid { grid-template-columns: 1fr !important; }
+                }
+                
+                /* List Layout */
+                .mpi-posts-list {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 1.5rem;
+                    margin: 2rem 0;
+                }
+                
+                .mpi-posts-list .mpi-post {
+                    display: grid;
+                    grid-template-columns: 250px 1fr;
+                    gap: 1.5rem;
+                }
+                
+                .mpi-posts-list .mpi-post-image {
+                    padding-bottom: 0;
+                    height: 150px;
+                }
+                
+                @media (max-width: 768px) {
+                    .mpi-posts-list .mpi-post {
+                        grid-template-columns: 1fr;
+                    }
+                }
+                
+                /* Compact Layout */
+                .mpi-posts-compact {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 1rem;
+                    margin: 2rem 0;
+                }
+                
+                .mpi-posts-compact .mpi-post {
+                    padding: 1rem;
+                    border-bottom: 1px solid #eee;
+                }
+                
+                .mpi-posts-compact .mpi-post-image {
+                    display: none;
+                }
+                
+                .mpi-posts-compact .mpi-post-title {
+                    font-size: 1.1rem;
+                    margin-bottom: 0.5rem;
+                }
+                
+                .mpi-posts-compact .mpi-post-excerpt {
+                    font-size: 0.9rem;
+                }
+                
+                /* Featured Layout */
+                .mpi-posts-featured {
+                    display: grid;
+                    gap: 2rem;
+                    margin: 2rem 0;
+                }
+                
+                .mpi-posts-featured .mpi-post.mpi-featured {
+                    grid-column: 1 / -1;
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 2rem;
+                }
+                
+                .mpi-posts-featured .mpi-post.mpi-featured .mpi-post-image {
+                    padding-bottom: 60%;
+                }
+                
+                .mpi-posts-featured .mpi-post.mpi-featured .mpi-post-title {
+                    font-size: 2rem;
+                }
+                
+                @media (max-width: 768px) {
+                    .mpi-posts-featured .mpi-post.mpi-featured {
+                        grid-template-columns: 1fr;
+                    }
                 }
                 
                 .mpi-post {
